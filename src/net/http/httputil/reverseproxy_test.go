@@ -1360,7 +1360,15 @@ func TestReverseProxyWebSocket(t *testing.T) {
 	defer backendServer.Close()
 
 	backURL, _ := url.Parse(backendServer.URL)
-	rproxy := NewSingleHostReverseProxy(backURL)
+	rproxy := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backURL)
+			if r.In.Header.Get("Upgrade") != "" {
+				r.Out.Header.Set("Connection", "Upgrade")
+				r.Out.Header.Set("Upgrade", r.In.Header.Get("Upgrade"))
+			}
+		},
+	}
 	rproxy.ErrorLog = log.New(io.Discard, "", 0) // quiet for tests
 	rproxy.ModifyResponse = func(res *http.Response) error {
 		res.Header.Add("X-Modified", "true")
@@ -1477,7 +1485,15 @@ func TestReverseProxyWebSocketCancellation(t *testing.T) {
 	defer cst.Close()
 
 	backendURL, _ := url.Parse(cst.URL)
-	rproxy := NewSingleHostReverseProxy(backendURL)
+	rproxy := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backendURL)
+			if r.In.Header.Get("Upgrade") != "" {
+				r.Out.Header.Set("Connection", "Upgrade")
+				r.Out.Header.Set("Upgrade", r.In.Header.Get("Upgrade"))
+			}
+		},
+	}
 	rproxy.ErrorLog = log.New(io.Discard, "", 0) // quiet for tests
 	rproxy.ModifyResponse = func(res *http.Response) error {
 		res.Header.Add("X-Modified", "true")
@@ -1657,7 +1673,15 @@ func TestReverseProxyWebSocketHalfTCP(t *testing.T) {
 			defer backendServer.Close()
 
 			backendURL, _ := url.Parse(backendServer.URL)
-			rproxy := NewSingleHostReverseProxy(backendURL)
+			rproxy := &ReverseProxy{
+				Rewrite: func(r *ProxyRequest) {
+					r.SetURL(backendURL)
+					if r.In.Header.Get("Upgrade") != "" {
+						r.Out.Header.Set("Connection", "Upgrade")
+						r.Out.Header.Set("Upgrade", r.In.Header.Get("Upgrade"))
+					}
+				},
+			}
 			rproxy.ErrorLog = log.New(io.Discard, "", 0) // quiet for tests
 			frontendProxy := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 				rproxy.ServeHTTP(rw, req)
@@ -1724,7 +1748,15 @@ func TestReverseProxyUpgradeNoCloseWrite(t *testing.T) {
 
 	// The proxy includes a ModifyResponse function which replaces the response body
 	// with its own wrapper, dropping the original body's CloseWrite method.
-	proxyHandler := NewSingleHostReverseProxy(backendURL)
+	proxyHandler := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backendURL)
+			if r.In.Header.Get("Upgrade") != "" {
+				r.Out.Header.Set("Connection", "Upgrade")
+				r.Out.Header.Set("Upgrade", r.In.Header.Get("Upgrade"))
+			}
+		},
+	}
 	proxyHandler.ModifyResponse = func(resp *http.Response) error {
 		type readWriteCloserOnly struct {
 			io.ReadWriteCloser
@@ -2125,6 +2157,10 @@ func TestReverseProxyHijackCopyError(t *testing.T) {
 	proxyHandler := &ReverseProxy{
 		Rewrite: func(r *ProxyRequest) {
 			r.SetURL(backendURL)
+			if r.In.Header.Get("Upgrade") != "" {
+				r.Out.Header.Set("Connection", "Upgrade")
+				r.Out.Header.Set("Upgrade", r.In.Header.Get("Upgrade"))
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Body = &testReadWriteCloser{
@@ -2153,6 +2189,254 @@ func TestReverseProxyHijackCopyError(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.tld/", nil)
 	req.Header.Set("Upgrade", "someproto")
 	proxyHandler.ServeHTTP(rw, req)
+}
+
+func TestReverseProxyH2cUpgradeBlocked(t *testing.T) {
+	backendGotUpgrade := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if upgradeType(r.Header) != "" {
+			backendGotUpgrade = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxyHandler := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backendURL)
+		},
+	}
+	frontend := httptest.NewServer(proxyHandler)
+	defer frontend.Close()
+
+	req, _ := http.NewRequest("GET", frontend.URL, nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "h2c")
+	res, err := frontend.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %v; want %v", res.StatusCode, http.StatusOK)
+	}
+	if backendGotUpgrade {
+		t.Error("backend received Upgrade header; want no Upgrade header")
+	}
+}
+
+func TestReverseProxyUnrequestedUpgradeRejected(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", "someproto")
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxyHandler := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backendURL)
+		},
+	}
+	frontend := httptest.NewServer(proxyHandler)
+	defer frontend.Close()
+
+	req, _ := http.NewRequest("GET", frontend.URL, nil)
+	res, err := frontend.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %v; want %v", res.StatusCode, http.StatusBadGateway)
+	}
+}
+
+func TestReverseProxyExplicitWebSocketUpgrade(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if upgradeType(r.Header) != "websocket" {
+			t.Error("unexpected backend request")
+			http.Error(w, "unexpected request", 400)
+			return
+		}
+		c, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer c.Close()
+		io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: WebSocket\r\n\r\n")
+		bs := bufio.NewScanner(c)
+		if !bs.Scan() {
+			t.Errorf("backend failed to read line from client: %v", bs.Err())
+			return
+		}
+		fmt.Fprintf(c, "backend got %q\n", bs.Text())
+	}))
+	defer backendServer.Close()
+
+	backURL, _ := url.Parse(backendServer.URL)
+	rproxy := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backURL)
+			if r.In.Header.Get("Upgrade") == "websocket" {
+				r.Out.Header.Set("Connection", "Upgrade")
+				r.Out.Header.Set("Upgrade", "websocket")
+			}
+		},
+	}
+
+	frontendProxy := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rproxy.ServeHTTP(rw, req)
+	}))
+	defer frontendProxy.Close()
+
+	req, _ := http.NewRequest("GET", frontendProxy.URL, nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	c := frontendProxy.Client()
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 101 {
+		t.Fatalf("status = %v; want 101", res.Status)
+	}
+	if !ascii.EqualFold(upgradeType(res.Header), "websocket") {
+		t.Fatalf("not websocket upgrade; got %#v", res.Header)
+	}
+	rwc, ok := res.Body.(io.ReadWriteCloser)
+	if !ok {
+		t.Fatalf("response body is of type %T; does not implement ReadWriteCloser", res.Body)
+	}
+	defer rwc.Close()
+
+	io.WriteString(rwc, "Hello\n")
+	bs := bufio.NewScanner(rwc)
+	if !bs.Scan() {
+		t.Fatalf("Scan: %v", bs.Err())
+	}
+	got := bs.Text()
+	want := `backend got "Hello"`
+	if got != want {
+		t.Errorf("got %#q, want %#q", got, want)
+	}
+}
+
+func TestReverseProxyExplicitInvalidUpgradeRejected(t *testing.T) {
+	backendURL, err := url.Parse("http://example.tld/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyHandler := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backendURL)
+			r.Out.Header.Set("Connection", "Upgrade")
+			r.Out.Header.Set("Upgrade", "bad\x01proto")
+		},
+	}
+
+	rw := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "http://example.tld/", nil)
+	proxyHandler.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusBadGateway {
+		t.Fatalf("status = %v; want %v", rw.Code, http.StatusBadGateway)
+	}
+}
+
+func TestReverseProxyDirectorUpgradeStripped(t *testing.T) {
+	// Verify that Upgrade headers added by Director are silently removed
+	// by removeHopByHopHeaders, which runs after Director.
+	backendGotUpgrade := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if upgradeType(r.Header) != "" {
+			backendGotUpgrade = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Director attempts to add Upgrade headers, but they will be stripped
+	proxyHandler := &ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = backendURL.Scheme
+			req.URL.Host = backendURL.Host
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+		},
+	}
+	frontend := httptest.NewServer(proxyHandler)
+	defer frontend.Close()
+
+	req, _ := http.NewRequest("GET", frontend.URL, nil)
+	res, err := frontend.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %v; want %v", res.StatusCode, http.StatusOK)
+	}
+	if backendGotUpgrade {
+		t.Error("backend received Upgrade header added by Director; want headers stripped")
+	}
+}
+
+func TestReverseProxyDirectorUpgradeReturns502(t *testing.T) {
+	// Verify that when Director tries to forward Upgrade but backend returns 101,
+	// the proxy returns 502 because the outbound request has no Upgrade header.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", "websocket")
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Director attempts to add Upgrade headers
+	proxyHandler := &ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = backendURL.Scheme
+			req.URL.Host = backendURL.Host
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+		},
+	}
+	frontend := httptest.NewServer(proxyHandler)
+	defer frontend.Close()
+
+	req, _ := http.NewRequest("GET", frontend.URL, nil)
+	res, err := frontend.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	// Should get 502 because outbound request has no Upgrade (stripped),
+	// but backend returned 101
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %v; want %v", res.StatusCode, http.StatusBadGateway)
+	}
 }
 
 type testResponseWriter struct {
