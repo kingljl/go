@@ -461,11 +461,6 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	outreq.Close = false
 
-	reqUpType := upgradeType(outreq.Header)
-	if !ascii.IsPrint(reqUpType) {
-		p.getErrorHandler()(rw, req, fmt.Errorf("client tried to switch to invalid protocol %q", reqUpType))
-		return
-	}
 	removeHopByHopHeaders(outreq.Header)
 
 	// Issue 21096: tell backend applications that care about trailer support
@@ -475,13 +470,6 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// the latter has passed through removeHopByHopHeaders.
 	if httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
 		outreq.Header.Set("Te", "trailers")
-	}
-
-	// After stripping all the hop-by-hop connection headers above, add back any
-	// necessary for protocol upgrades, such as for websockets.
-	if reqUpType != "" {
-		outreq.Header.Set("Connection", "Upgrade")
-		outreq.Header.Set("Upgrade", reqUpType)
 	}
 
 	if p.Rewrite != nil {
@@ -522,6 +510,14 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		// If the outbound request doesn't have a User-Agent header set,
 		// don't send the default Go HTTP client User-Agent.
 		outreq.Header.Set("User-Agent", "")
+	}
+
+	// After stripping hop-by-hop headers and applying Rewrite, validate any
+	// Upgrade header that Rewrite explicitly set.
+	reqUpType := upgradeType(outreq.Header)
+	if reqUpType != "" && !ascii.IsPrint(reqUpType) {
+		p.getErrorHandler()(rw, req, fmt.Errorf("outbound request has invalid upgrade protocol %q", reqUpType))
+		return
 	}
 
 	var (
@@ -807,7 +803,11 @@ func upgradeType(h http.Header) string {
 func (p *ReverseProxy) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
-	if !ascii.IsPrint(resUpType) { // We know reqUpType is ASCII, it's checked by the caller.
+	if !ascii.IsPrint(reqUpType) {
+		p.getErrorHandler()(rw, req, fmt.Errorf("outbound request has invalid upgrade protocol %q", reqUpType))
+		return
+	}
+	if !ascii.IsPrint(resUpType) {
 		p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch to invalid protocol %q", resUpType))
 		return
 	}
